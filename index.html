@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>White Rust Analysis - Grid Method (Rectangular Grids Full Metal Part with aligned PDF)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: Arial, sans-serif; margin: 18px; }
+    h2 { margin-top: 0; }
+    .part-details { margin-bottom: 10px; font-size: 15px; }
+    .part-details span { margin-right: 24px; }
+    .controls { margin-bottom: 8px; display:flex; gap:12px; align-items:center; flex-wrap:wrap;}
+    canvas { border:1px solid #222; display:block; margin-top:10px; cursor:crosshair; max-width:100%; height:auto; }
+    .legend { margin-top:10px; font-size:13px; }
+    .legend div { margin:4px 0; }
+    .color-box { display:inline-block; width:14px; height:14px; margin-right:6px; vertical-align:middle; border:1px solid #666;}
+    #results { margin-top:10px; font-weight:600; }
+    label { font-size:14px; }
+    input[type="number"]{ width:70px; }
+    button { padding:6px 10px; }
+  </style>
+</head>
+<body>
+  <h2>White Rust Analysis - Grid Method</h2>
+  <div class="part-details" id="partDetailsDiv">
+    <span><strong>Part Number:</strong> <span id="partNoSpan">N/A</span></span>
+    <span><strong>Part Name:</strong> <span id="partNameSpan">N/A</span></span>
+  </div>
+  <div class="controls">
+    <input type="file" id="imageLoader" accept="image/*">
+    <label>Grid Count (per side): <input type="number" id="gridCount" min="2" value="10"></label>
+    <label>Fill color:
+      <select id="fillColor">
+        <option value="yellow">Yellow</option>
+        <option value="gray">Gray</option>
+      </select>
+    </label>
+    <button id="editPartDetails">Edit Part Details</button>
+    <button id="downloadPdf">Download Report (PDF)</button>
+  </div>
+  <canvas id="canvas"></canvas>
+  <div id="results">Yellow Grids: 0 / 0 — Final Percentage: 0%</div>
+  <div class="legend">
+    <strong>Legend</strong>
+    <div><span class="color-box" style="background:yellow"></span> Yellow = white-patch grid (counted)</div>
+    <div><span class="color-box" style="background:gray"></span> Gray = excluded from totals</div>
+    <div>Single click = fill selected color | Drag = bulk fill | Double-click = clear grid</div>
+  </div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script>
+const { jsPDF } = window.jspdf;
+const imageLoader = document.getElementById('imageLoader');
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const gridCountInput = document.getElementById('gridCount');
+const fillColorSelect = document.getElementById('fillColor');
+const resultsDiv = document.getElementById('results');
+const downloadPdfBtn = document.getElementById('downloadPdf');
+const partNoSpan = document.getElementById('partNoSpan');
+const partNameSpan = document.getElementById('partNameSpan');
+const editPartDetailsBtn = document.getElementById('editPartDetails');
+
+let img = null, bbox = null, cells = [];
+let gridCount = parseInt(gridCountInput.value) || 10;
+let isDragging = false, dragStart = null, dragCurrent = null;
+let partNo = "N/A", partName = "N/A";
+const zfLogo = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAAAQCAYAAAB49e1mAAAAHklEQVR42mNgGAVDEwMDA8J+g4GBgYAAJzYBCE3dK4AAAAASUVORK5CYII=";
+
+function updatePartDetailsUI() {
+  partNoSpan.textContent = partNo;
+  partNameSpan.textContent = partName;
+}
+
+updatePartDetailsUI();
+
+editPartDetailsBtn.addEventListener('click', () => {
+  partNo = prompt("Enter Part Number:", partNo || "PN-001") || "N/A";
+  partName = prompt("Enter Part Name:", partName || "Sample Part") || "N/A";
+  updatePartDetailsUI();
+});
+
+gridCountInput.addEventListener('input', () => {
+  gridCount = Math.max(2, parseInt(gridCountInput.value) || 10);
+  rebuildCellsAndDraw();
+});
+
+imageLoader.addEventListener('change', handleImage);
+
+canvas.addEventListener('mousedown', e => {
+  if (!img || !bbox) return;
+  const rect = canvas.getBoundingClientRect();
+  isDragging = true;
+  dragStart = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+  dragCurrent = { ...dragStart };
+  redraw();
+});
+
+canvas.addEventListener('mousemove', e => {
+  if (!img || !bbox || !isDragging) return;
+  const rect = canvas.getBoundingClientRect();
+  dragCurrent = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+  redraw();
+  drawPreviewRect();
+});
+
+canvas.addEventListener('mouseup', e => {
+  if (!img || !bbox) return;
+  const rect = canvas.getBoundingClientRect();
+  const up = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+  const moveDist = Math.hypot(up.x - dragStart.x, up.y - dragStart.y);
+  const selectedColor = fillColorSelect.value;
+  if (moveDist < 6) {
+    const { r, c } = cellAt(dragStart.x, dragStart.y);
+    if (r !== null) {
+      const cell = cells.find(it => it.r === r && it.c === c);
+      if (cell) cell.fill = selectedColor;
+    }
+  } else {
+    const minX = Math.min(dragStart.x, up.x), maxX = Math.max(dragStart.x, up.x);
+    const minY = Math.min(dragStart.y, up.y), maxY = Math.max(dragStart.y, up.y);
+    for (const cell of cells) {
+      if (
+        cell.x + cell.w > minX &&
+        cell.x < maxX &&
+        cell.y + cell.h > minY &&
+        cell.y < maxY
+      ) {
+        cell.fill = selectedColor;
+      }
+    }
+  }
+  isDragging = false;
+  dragStart = null;
+  dragCurrent = null;
+  redraw();
+});
+
+canvas.addEventListener('dblclick', e => {
+  if (!img || !bbox) return;
+  const rect = canvas.getBoundingClientRect();
+  const x = e.clientX - rect.left, y = e.clientY - rect.top;
+  const { r, c } = cellAt(x, y);
+  if (r === null) return;
+  const cell = cells.find(it => it.r === r && it.c === c);
+  if (cell) { cell.fill = null; redraw(); }
+});
+
+function handleImage(ev) {
+  const file = ev.target.files && ev.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = function(e) {
+    img = new Image();
+    img.onload = function() {
+      canvas.width = img.width;
+      canvas.height = img.height;
+      ctx.drawImage(img, 0, 0);
+      bbox = detectBoundingBox();
+      rebuildCellsAndDraw();
+    };
+    img.src = e.target.result;
+  };
+  reader.readAsDataURL(file);
+}
+
+function detectBoundingBox() {
+  const w = canvas.width, h = canvas.height;
+  const data = ctx.getImageData(0, 0, w, h).data;
+  let minX = w, minY = h, maxX = 0, maxY = 0;
+  const BG_THRESHOLD = 240;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const idx = (y * w + x) * 4;
+      const r = data[idx], g = data[idx + 1], b = data[idx + 2], a = data[idx + 3];
+      if (a === 0) continue;
+      if (!(r >= BG_THRESHOLD && g >= BG_THRESHOLD && b >= BG_THRESHOLD)) {
+        if (x < minX) minX = x;
+        if (y < minY) minY = y;
+        if (x > maxX) maxX = x;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+  if (minX > maxX || minY > maxY) {
+    return { x: 0, y: 0, w: w, h: h };
+  }
+  return {
+    x: Math.max(0, minX - 1),
+    y: Math.max(0, minY - 1),
+    w: Math.min(w - Math.max(0, minX - 1), maxX - minX + 3),
+    h: Math.min(h - Math.max(0, minY - 1), maxY - minY + 3),
+  };
+}
+
+function rebuildCellsAndDraw() {
+  if (!img || !bbox) return;
+  cells = [];
+  const rows = gridCount, cols = gridCount;
+  const cellWidth = bbox.w / cols;
+  const cellHeight = bbox.h / rows;
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const x = bbox.x + c * cellWidth;
+      const y = bbox.y + r * cellHeight;
+      cells.push({ r, c, x, y, w: cellWidth, h: cellHeight, hasContent: true, fill: null });
+    }
+  }
+  redraw();
+}
+
+function redraw() {
+  if (!img) return;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(img, 0, 0);
+
+  if (bbox) {
+    ctx.save();
+    ctx.strokeStyle = "#00a2ff";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(bbox.x - 1, bbox.y - 1, bbox.w + 2, bbox.h + 2);
+    ctx.restore();
+  }
+
+  let yellowCount = 0, totalCount = 0;
+  for (const cell of cells) {
+    if (cell.fill === 'gray') {
+      ctx.fillStyle = 'rgba(128,128,128,0.6)';
+      ctx.fillRect(cell.x, cell.y, cell.w, cell.h);
+    } else if (cell.fill === 'yellow') {
+      ctx.fillStyle = 'rgba(255,255,0,0.6)';
+      ctx.fillRect(cell.x, cell.y, cell.w, cell.h);
+      yellowCount++;
+      totalCount++;
+    } else {
+      totalCount++;
+    }
+    ctx.strokeStyle = '#222';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(cell.x, cell.y, cell.w, cell.h);
+  }
+  const percent = totalCount ? ((yellowCount / totalCount) * 100).toFixed(2) : "0.00";
+  resultsDiv.innerHTML = `Yellow Grids: ${yellowCount} / ${totalCount} &nbsp; — &nbsp; Final Percentage: <strong>${percent}%</strong>`;
+}
+
+function cellAt(x, y) {
+  for (const cell of cells) {
+    if (
+      x >= cell.x &&
+      x < cell.x + cell.w &&
+      y >= cell.y &&
+      y < cell.y + cell.h
+    ) {
+      return { r: cell.r, c: cell.c };
+    }
+  }
+  return { r: null, c: null };
+}
+
+function drawPreviewRect() {
+  if (!isDragging || !dragStart || !dragCurrent) return;
+  const x = Math.min(dragStart.x, dragCurrent.x);
+  const y = Math.min(dragStart.y, dragCurrent.y);
+  const w = Math.abs(dragCurrent.x - dragStart.x);
+  const h = Math.abs(dragCurrent.y - dragStart.y);
+  ctx.save();
+  ctx.fillStyle = "rgba(0, 120, 215, 0.18)";
+  ctx.fillRect(x, y, w, h);
+  ctx.strokeStyle = "rgba(0, 120, 215, 0.9)";
+  ctx.lineWidth = 1;
+  ctx.strokeRect(x, y, w, h);
+  ctx.restore();
+}
+
+downloadPdfBtn.addEventListener('click', async () => {
+  if (!img) { alert('Load an image first'); return; }
+  redraw();
+  setTimeout(() => {
+    const pdf = new jsPDF('p', 'pt', 'a4');
+    const pageWidth = pdf.internal.pageSize.getWidth();
+    const marginLeft = 40;
+
+    const logoW = 90, logoH = 40;
+    try {
+      pdf.addImage(zfLogo, 'PNG', marginLeft, 20, logoW, logoH);
+    } catch (err) {
+      console.warn('Logo not added to PDF (invalid base64).', err);
+    }
+    const dateStr = new Date().toLocaleString();
+    pdf.setFont("helvetica", "normal");
+    pdf.setFontSize(11);
+    pdf.text(`Date: ${dateStr}`, pageWidth - marginLeft, 34, { align: 'right' });
+
+    pdf.setFont("helvetica", "bold");
+    pdf.setFontSize(16);
+    pdf.text("White Rust Analysis - Grid Method", pageWidth / 2, 90, { align: 'center' });
+
+    pdf.setFont("helvetica", "normal");
+    pdf.setFontSize(12);
+
+    // Part details with left margin and spacing
+    let partY = 110;
+    pdf.text(`Part Number: ${partNo}`, marginLeft, partY);
+    partY += 18;
+    pdf.text(`Part Name: ${partName}`, marginLeft, partY);
+
+    // Results text left aligned below part details
+    const resultText = resultsDiv.innerText.split("\n");
+    let resultY = partY + 30;
+    for (let i = 0; i < resultText.length; i++) {
+      const line = resultText[i];
+      if (line.includes("Final Percentage")) {
+        pdf.setFont("helvetica", "bold");
+        pdf.setFontSize(14);
+        pdf.text(line.replace('Final Percentage:', 'Final Percentage:'), marginLeft, resultY + i * 20);
+      } else {
+        pdf.setFont("helvetica", "normal");
+        pdf.setFontSize(12);
+        pdf.text(line, marginLeft, resultY + i * 20);
+      }
+    }
+
+    const maxWidth = 420, maxHeight = 520;
+    let imgW = canvas.width, imgH = canvas.height;
+    const wScale = maxWidth / imgW;
+    const hScale = maxHeight / imgH;
+    const scale = Math.min(wScale, hScale, 1);
+    imgW = imgW * scale; imgH = imgH * scale;
+    const xOffset = (pageWidth - imgW) / 2;
+    try {
+      const dataUrl = canvas.toDataURL('image/png');
+      pdf.addImage(dataUrl, 'PNG', xOffset, resultY + 80, imgW, imgH);
+    } catch (err) {
+      alert("PDF generation failed due to canvas image security restrictions. Try using a different browser or allow local file read.");
+      console.error(err);
+      return;
+    }
+
+    const fn = `WhiteRustReport_${(partNo || 'N_A').replace(/\s+/g, '_')}.pdf`;
+    pdf.save(fn);
+  }, 200);
+});
+</script>
+</body>
+</html>
